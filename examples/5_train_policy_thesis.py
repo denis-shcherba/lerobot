@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.utils import dataset_to_policy_features, create_policy_features
+from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.configs.types import FeatureType
@@ -48,13 +48,13 @@ def main():
     #   - input/output shapes: to properly size the policy
     #   - dataset stats: for normalization and denormalization of input/outputs
     dataset_metadata = LeRobotDatasetMetadata("lerobot/pusht")
-    features = create_policy_features(dataset_metadata.features)
+    features = dataset_to_policy_features(dataset_metadata.features)
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     input_features = {key: ft for key, ft in features.items() if key not in output_features}
     
-    local_path = "my_final_lerobot_dataset/"
+    local_path = "/home/denis/git/lerobot/examples/lerobot_datasets/my_final_rgb_dataset/"
     dataset_metadata_ = LeRobotDatasetMetadata(local_path, root=local_path)
-    features_ = create_policy_features(dataset_metadata_.features)
+    features_ = dataset_to_policy_features(dataset_metadata_.features)
     output_features_ = {key: ft for key, ft in features_.items() if ft.type is FeatureType.ACTION}
     input_features_ = {key: ft for key, ft in features_.items() if key not in output_features}
 
@@ -88,7 +88,7 @@ def main():
     }
 
     # We can then instantiate the dataset with these delta_timestamps configuration.
-    dataset = LeRobotDataset("local_path", delta_timestamps=delta_timestamps)
+    dataset = LeRobotDataset(local_path, delta_timestamps=delta_timestamps)
 
     # Then we create our optimizer and dataloader for offline training.
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)

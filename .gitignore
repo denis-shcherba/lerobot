@@ -177,3 +177,7 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# denis
+demos/
+lerobot_datasets/

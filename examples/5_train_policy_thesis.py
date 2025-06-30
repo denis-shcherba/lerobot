@@ -40,7 +40,7 @@ def main():
 
     # Number of offline training steps (we'll only do offline training for this example.)
     # Adjust as you prefer. 5000 steps are needed to get something worth evaluating.
-    training_steps = 5000
+    training_steps = 100
     log_freq = 1
 
     # When starting from scratch (i.e. not from a pretrained policy), we need to specify 2 things before
@@ -79,7 +79,7 @@ def main():
     delta_timestamps = {
         # Load the previous image and state at -0.1 seconds before current frame,
         # then load current image and state corresponding to 0.0 second.
-        #"observation.image": [-0.1, 0.0],
+        "observation.image": [-0.1, 0.0],
         "observation.state": [-0.1, 0.0],
         # Load the previous action (-0.1), the next action to be executed (0.0),
         # and 14 future actions with a 0.1 seconds spacing. All these actions will be

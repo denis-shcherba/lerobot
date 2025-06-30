@@ -178,3 +178,4 @@ cython_debug/
 # denis
 demos/
 lerobot_datasets/
+z.*

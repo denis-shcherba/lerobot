@@ -2,12 +2,12 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from envs.create_env import ShelfPullDataCollector 
 import robotic as ry
 import h5py
 from envs.shelf import generate_shelf
 from envs.high_level_methods import RobotEnviroment
 from envs.book_spawning import generate_random_box_params
+from envs.simulator import Simulator
 
 # print("Importing ShelfEnv...")
 class ShelfEnv(gym.Env):
@@ -15,6 +15,8 @@ class ShelfEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
 
     def __init__(self, 
+                 obs_type ="pixels_agent_pos",
+                 ############# ROBOT MODE #############
                  robot_mode="floating",
                  collect_data=True,
                  path_mode="SE39D",
@@ -33,6 +35,7 @@ class ShelfEnv(gym.Env):
         # --- Your Custom Initialization ---
         # E.g., connect to a simulator, set up robot parameters
         print(f"Initializing MyCustomEnv with")
+        self.obs_type = obs_type
         self.robot_mode = robot_mode
         self.collect_data = collect_data
         self.path_mode = path_mode
@@ -46,8 +49,14 @@ class ShelfEnv(gym.Env):
         self.box_size_ranges = box_size_ranges
         self.books = []
 
+        camera_quat = ry.Quaternion().setRollPitchYaw([-np.pi/2, np.pi/2, 0]) * ry.Quaternion().setRollPitchYaw([-.1, 0, 0])
+        self.C.addFrame("worldCamera").setShape(ry.ST.camera, [.1]).setPosition([1,0,0]).setAttribute("focalLength", .895).setPosition([-.5, 0, 1.5]).setQuaternion(camera_quat.asArr())
+        self.C.view_setCamera(self.C.getFrame("worldCamera"))
+        
         self._create_shelf_scene(shelf_pos_xyz, shelf_quaternion, shelf_openings_small, shelf_equidistant)
         self.q0 = self.C.getJointState()
+
+        self.sim = Simulator(self.C, verbose=0)
 
         # --- Define Action and Observation Spaces ---
         # These must match the policy's expectations.
@@ -55,20 +64,32 @@ class ShelfEnv(gym.Env):
         # 1. Define the Action Space
         # This should match the output of your policy. For example, a 2D continuous action.
         # Use spaces.Box for continuous actions: (low, high, shape, dtype)
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
 
         # 2. Define the Observation Space
         # This MUST match the `obs_type="pixels_agent_pos"` from the PushT example.
         # It's a dictionary with keys "pixels" and "agent_pos".
         # The shapes and dtypes must also match what the policy was trained on.
-        self.observation_space = spaces.Dict(
-            {
-                # The camera image from your environment
-                "pixels": spaces.Box(low=0, high=255, shape=(96, 96, 3), dtype=np.uint8),
-                # The state vector (e.g., robot joint positions, end-effector pose)
-                "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32),
-            }
-        )
+        if self.obs_type == "pixels_agent_pos":
+            self.observation_space = spaces.Dict(
+                {
+                    "pixels": spaces.Box(low=0, high=255, shape=(96, 96, 3), dtype=np.uint8),
+                    "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+                }
+            )
+        elif self.obs_type == "points_agent_pos":
+            # Define the observation space for points_agent_pos
+            # A common setup for point clouds is (N_SAMPLES, 3) for XYZ or (N_SAMPLES, 6) for XYZ+RGB
+            n_points = 4096 # Matches your getPoints n_samples
+            self.observation_space = spaces.Dict(
+                {
+                    # Assuming points are float32 XYZ coordinates
+                    "points": spaces.Box(low=-np.inf, high=np.inf, shape=(n_points, 3), dtype=np.float32),
+                    "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+                }
+            )
+        else:
+            raise ValueError(f"Unknown observation type: {obs_type}")
 
 
 
@@ -175,11 +196,19 @@ class ShelfEnv(gym.Env):
                 .setMass(.1)
 
     def _get_obs(self):
-        # Your logic to get the current observation from your simulator
-        pixels = np.random.randint(0, 256, size=(96, 96, 3), dtype=np.uint8) # Replace with your camera data
-        #points = ...
-        agent_pos = self.C.getJointState()[:3]  
-        return {"pixels": pixels, "agent_pos": agent_pos}
+        agent_pos_raw = self.C.getJointState()[:3]
+        agent_pos = np.array(agent_pos_raw, dtype=np.float32)
+
+        observation = {}
+        if self.obs_type == "pixels_agent_pos":
+            pixels = self.sim.getRGB(crop=True, crop_size=96)
+            observation["pixels"] = pixels
+        elif self.obs_type == "points_agent_pos":
+            points = self.sim.getPoints(n_samples=4096, vis=True)
+            observation["points"] = points
+        
+        observation["agent_pos"] = agent_pos
+        return observation
 
     def _get_info(self):
         # Returns auxiliary diagnostic information (optional)
@@ -187,9 +216,7 @@ class ShelfEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
-        # Your logic to reset your environment to an initial state
-        # E.g., move robot to starting position
+
         print("Resetting the environment.")
         
         self.C.setJointState(self.q0)
@@ -204,6 +231,11 @@ class ShelfEnv(gym.Env):
         observation = self._get_obs()
         info = self._get_info()
         
+        print(f"Observation space: {self.observation_space}")
+        print(f"Observation to return: {observation}")
+        print(f"Type of observation: {type(observation)}")
+        print(f"Shape of observation: {observation.shape if hasattr(observation, 'shape') else 'N/A'}")
+
         return observation, info
 
     def step(self, action):
@@ -212,7 +244,7 @@ class ShelfEnv(gym.Env):
         print(f"Executing action: {action}")
         
         # --- Apply action and get new state ---
-        self.collector.C.setJointState([action[0], action[1], action[2], 1, 0, 0, 0])  # Assuming the first 7 values are joint angles
+        self.C.setJointState([action[0], action[1], action[2], 1, 0, 0, 0])  # Assuming the first 7 values are joint angles
 
         # --- After action, get the new results ---
         observation = self._get_obs()
@@ -221,6 +253,7 @@ class ShelfEnv(gym.Env):
         truncated = False # Your logic for whether the episode was cut short (e.g., time limit)
         info = self._get_info()
         
+        self.C.view(True)  # Update the view after the action
         # The step function MUST return these five values in this order
         return observation, reward, terminated, truncated, info
 
@@ -234,7 +267,6 @@ class ShelfEnv(gym.Env):
     def close(self):
         # Clean up any resources (e.g., close simulator connection)
         print("Closing the environment.")
-        # self.my_simulator.disconnect()
 
 
 # TODO maybe overload the BaseRobotEnv class to implement a environments for different robot actions.

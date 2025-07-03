@@ -25,6 +25,8 @@ pip install -e ".[pusht]"
 from pathlib import Path
 
 import gym_pusht  # noqa: F401
+import lerobot.shelf_env.env  # noqa: F401 
+
 import gymnasium as gym
 import imageio
 import numpy
@@ -32,8 +34,11 @@ import torch
 
 from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
+
+print("Attempting to create the environment: ShelfEnv-v0")
+# 1. Create an instance of your environment
 # Create a directory to store the video of the evaluation
-output_directory = Path("outputs/eval/example_pusht_diffusion")
+output_directory = Path("outputs/eval/example_shelf")
 output_directory.mkdir(parents=True, exist_ok=True)
 
 # Select your device
@@ -49,11 +54,7 @@ policy = DiffusionPolicy.from_pretrained(pretrained_policy_path)
 # Initialize evaluation environment to render two observation types:
 # an image of the scene and state/position of the agent. The environment
 # also automatically stops running after 300 interactions/steps.
-env = gym.make(
-    "gym_pusht/PushT-v0",
-    obs_type="pixels_agent_pos",
-    max_episode_steps=300,
-)
+env = gym.make("ShelfEnv-v0", obs_type="pixels_agent_pos") 
 
 # We can verify that the shapes of the features expected by the policy match the ones from the observations
 # produced by the environment

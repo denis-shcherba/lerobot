@@ -3,121 +3,223 @@ import json
 import os
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pathlib import Path
 
+# --- Helper Class for Streaming Statistics ---
+class StreamingStats:
+    def __init__(self, shape, is_image=False):
+        self.n = 0
+        self.shape = shape
+        self.is_image = is_image
+        
+        # Initialize accumulators
+        # If image (C, H, W), we calculate stats per channel -> shape (C,)
+        # If state (D,), we calculate per dimension -> shape (D,)
+        if self.is_image:
+            self.stat_shape = (shape[0],) # Channels only
+        else:
+            self.stat_shape = shape
+            
+        self.sum = np.zeros(self.stat_shape, dtype=np.float64)
+        self.sum_sq = np.zeros(self.stat_shape, dtype=np.float64)
+        self.min = np.full(self.stat_shape, np.inf, dtype=np.float64)
+        self.max = np.full(self.stat_shape, -np.inf, dtype=np.float64)
+
+    def update(self, data):
+        """
+        data: single frame numpy array.
+        """
+        # Handle Images: Flatten spatial dims to accumulate stats per channel
+        if self.is_image:
+            # Data comes in as (C, H, W). We want stats over H*W for this image
+            # Transpose to (H, W, C) -> Reshape to (pixels, C)
+            flat_data = data.transpose(1, 2, 0).reshape(-1, self.stat_shape[0]).astype(np.float64)
+        else:
+            # Ensure 1D for states/actions
+            flat_data = data.reshape(1, -1).astype(np.float64)
+
+        # Update stats
+        count = flat_data.shape[0]
+        self.n += count
+        self.sum += flat_data.sum(axis=0)
+        self.sum_sq += (flat_data ** 2).sum(axis=0)
+        self.min = np.minimum(self.min, flat_data.min(axis=0))
+        self.max = np.maximum(self.max, flat_data.max(axis=0))
+
+    def get_final_stats(self):
+        mean = self.sum / self.n
+        # Variance = E[X^2] - (E[X])^2
+        variance = (self.sum_sq / self.n) - (mean ** 2)
+        # Numerical stability clip
+        variance = np.maximum(variance, 0)
+        std = np.sqrt(variance)
+
+        # Reshape to (C, 1, 1) for images if needed, or flat for others
+        if self.is_image:
+            return {
+                "mean": mean.reshape(-1, 1, 1).tolist(),
+                "std": std.reshape(-1, 1, 1).tolist(),
+                "min": self.min.reshape(-1, 1, 1).tolist(),
+                "max": self.max.reshape(-1, 1, 1).tolist()
+            }
+        else:
+            return {
+                "mean": mean.tolist(),
+                "std": std.tolist(),
+                "min": self.min.tolist(),
+                "max": self.max.tolist()
+            }
+
 def convert_h5_to_final_lerobot_format(h5_file_path, output_path):
-    """
-    Converts a single HDF5 file into a final, fully compliant LeRobot dataset.
-    This version reshapes the image statistics to (C, 1, 1) to fix library broadcasting issues.
-    """
-    print("--- Starting Final LeRobot Dataset Conversion ---")
+    print("--- Starting Final LeRobot Dataset Conversion (Memory Optimized) ---")
     output_path = Path(output_path)
     data_dir = output_path / "data"
     meta_dir = output_path / "meta"
 
-    # 1. Create the required directory structure
-    print(f"Creating directories at {output_path}...")
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
 
-    # 2. Process the HDF5 file and gather all data
-    all_steps_data = []
-    all_episodes_metadata = []
-    observation_key = None
-    observation_type = None
-    task_description = None
-
+    # --- 1. Setup Phase ---
     print(f"Opening HDF5 file at {h5_file_path}...")
     with h5py.File(h5_file_path, 'r') as f:
         episode_keys = sorted([key for key in f.keys() if key.startswith('demo_')])
         if not episode_keys:
             raise ValueError("No episodes found in HDF5 file.")
-        print(f"Found {len(episode_keys)} episodes.")
-
-        # --- Auto-detect observation type from the first episode ---
-        first_episode_group = f[episode_keys[0]]
-        if 'points' in first_episode_group:
-            observation_key = 'points'
-            observation_type = 'point_cloud'
-            task_description = "act_point_cloud_imitation"
-            print("Detected 'point_cloud' data.")
-        elif 'rgb' in first_episode_group:
-            observation_key = 'rgb'
-            observation_type = 'image'
-            task_description = "act_rgb_imitation"
-            print("Detected 'image' data under the key 'rgb'.")
+        
+        # Detect types from first episode
+        first_grp = f[episode_keys[0]]
+        if 'points' in first_grp:
+            obs_key, obs_type, task_desc = 'points', 'point_cloud', "act_point_cloud_imitation"
+        elif 'rgb' in first_grp:
+            obs_key, obs_type, task_desc = 'rgb', 'image', "act_rgb_imitation"
         else:
-            raise ValueError("Could not find 'points' or 'rgb' data in the first episode.")
+            raise ValueError("Could not find 'points' or 'rgb' data.")
 
-        # --- Process all episodes ---
+        # Get shapes for initialization
+        sample_obs = first_grp[obs_key][0]
+        if obs_type == 'image':
+            # Convert (H, W, C) -> (C, H, W)
+            sample_obs = sample_obs.transpose(2, 0, 1)
+        
+        obs_shape = sample_obs.shape
+        state_shape = first_grp['path'][0].shape
+        action_shape = first_grp['path'][0].shape
+        obs_dtype = str(sample_obs.dtype)
+
+        print(f"Detected {obs_type} with shape {obs_shape}")
+
+        # Initialize Streaming Stats trackers
+        stats_trackers = {
+            f"observation.{obs_type}": StreamingStats(obs_shape, is_image=(obs_type=='image')),
+            "observation.state": StreamingStats(state_shape),
+            "action": StreamingStats(action_shape),
+            "timestamp": StreamingStats((1,))
+        }
+
+        # Setup Parquet Writer
+        parquet_path = data_dir / "episodes.parquet"
+        # Define Schema matches the dict structure we create below
+        # Note: PyArrow infers types well, but explicit schema is safer for images. 
+        # We will let pandas infer schema from the first chunk to keep code simple.
+        writer = None 
+        
+        buffer = []
+        BUFFER_SIZE = 500 # Adjust based on your RAM (500 frames is usually safe)
+        
+        all_episodes_metadata = []
+        total_frames = 0
+        
+        # --- 2. Processing Loop ---
+        print(f"Processing {len(episode_keys)} episodes...")
+        
         for episode_idx, group_name in enumerate(episode_keys):
             episode_group = f[group_name]
-            observation_data = episode_group[observation_key][:]
-            path_data = episode_group['path'][:]
-            states, actions = path_data, path_data
-            num_steps = actions.shape[0]
+            # Load only current episode into memory
+            raw_obs = episode_group[obs_key][:]
+            raw_path = episode_group['path'][:]
+            num_steps = raw_path.shape[0]
 
             episode_meta = {
                 "episode_index": episode_idx,
-                "tasks": [task_description],
+                "tasks": [task_desc],
                 "length": num_steps
             }
             all_episodes_metadata.append(episode_meta)
 
             for t in range(num_steps):
-                step_obs_data = observation_data[t]
+                # 1. Prepare Data
+                step_obs = raw_obs[t]
+                if obs_type == 'image':
+                    step_obs = step_obs.transpose(2, 0, 1) # HWC -> CHW
                 
-                # Transpose image data from (H, W, C) to (C, H, W)
-                if observation_type == 'image':
-                    step_obs_data = step_obs_data.transpose(2, 0, 1)
+                step_state = raw_path[t]
+                step_action = raw_path[t] # Assuming state=action as per your original script
+                
+                # 2. Update Statistics (Streaming)
+                stats_trackers[f"observation.{obs_type}"].update(step_obs)
+                stats_trackers["observation.state"].update(step_state)
+                stats_trackers["action"].update(step_action)
+                stats_trackers["timestamp"].update(np.array([float(t)]))
 
-                step_data = {
-                    f"observation.{observation_type}": step_obs_data.tolist(),
-                    "observation.state": states[t].tolist(),
-                    "action": actions[t].tolist(),
+                # 3. Create Row
+                row = {
+                    f"observation.{obs_type}": step_obs.tolist(), # Parquet handles lists
+                    "observation.state": step_state.tolist(),
+                    "action": step_action.tolist(),
                     "task_index": [0],
                     "episode_index": [episode_idx],
                     "frame_index": t,
                     "timestamp": [float(t)],
                     "next.done": (t == num_steps - 1),
                 }
-                all_steps_data.append(step_data)
+                buffer.append(row)
+                total_frames += 1
 
-    total_frames = len(all_steps_data)
-    total_episodes = len(episode_keys)
-    print(f"\nTotal episodes: {total_episodes}, Total frames/timesteps: {total_frames}")
+                # 4. Flush Buffer if full
+                if len(buffer) >= BUFFER_SIZE:
+                    df_chunk = pd.DataFrame(buffer)
+                    table = pa.Table.from_pandas(df_chunk)
+                    
+                    if writer is None:
+                        # Initialize writer with schema from first chunk
+                        writer = pq.ParquetWriter(parquet_path, table.schema)
+                    
+                    writer.write_table(table)
+                    buffer = [] # Clear memory
+            
+            if (episode_idx + 1) % 10 == 0:
+                print(f"Processed {episode_idx + 1} episodes...")
 
-    # 3. Save trajectory data to a parquet file
-    df = pd.DataFrame(all_steps_data)
-    parquet_path = data_dir / "episodes.parquet"
-    print(f"Saving data to {parquet_path}...")
-    df.to_parquet(parquet_path)
-    print("Data saved successfully.")
-
-    # 4. Create and save info.json dynamically
-    print("Generating info.json metadata...")
-    with h5py.File(h5_file_path, 'r') as f:
-        obs_data_sample = f['demo_0'][observation_key][0]
+        # Flush remaining buffer
+        if buffer:
+            df_chunk = pd.DataFrame(buffer)
+            table = pa.Table.from_pandas(df_chunk)
+            if writer is None:
+                writer = pq.ParquetWriter(parquet_path, table.schema)
+            writer.write_table(table)
         
-        if observation_type == 'image':
-            obs_data_sample = obs_data_sample.transpose(2, 0, 1)
+        if writer:
+            writer.close()
 
-        obs_shape = obs_data_sample.shape
-        obs_dtype = str(obs_data_sample.dtype)
-        state_shape = f['demo_0']['path'][0].shape
-        action_shape = f['demo_0']['path'][0].shape
+    print(f"Data saved to {parquet_path}")
 
+    # --- 3. Save Metadata (info.json, stats.json, etc) ---
+    print("Generating metadata...")
+
+    # Info.json
     info_dict = {
         "codebase_version": "v2.0",
-        "total_episodes": total_episodes,
+        "total_episodes": len(episode_keys),
         "total_frames": total_frames,
-        "chunks_size": 64,
+        "chunks_size": 64, # Default chunk size for training
         "fps": 30,
-        "splits": {"train": f"0:{total_episodes}"},
+        "splits": {"train": f"0:{len(episode_keys)}"},
         "data_path": "data/episodes.parquet",
         "features": {
-            f"observation.{observation_type}": {
-                "dtype": "image" if observation_type == 'image' else obs_dtype,
+            f"observation.{obs_type}": {
+                "dtype": "image" if obs_type == 'image' else obs_dtype,
                 "shape": list(obs_shape)
             },
             "observation.state": {"dtype": "float32", "shape": list(state_shape)},
@@ -130,77 +232,42 @@ def convert_h5_to_final_lerobot_format(h5_file_path, output_path):
         }
     }
     
-    if observation_type == 'image':
-        image_feature_key = f"observation.{observation_type}"
-        info_dict["features"][image_feature_key]["names"] = ["channel", "height", "width"]
+    if obs_type == 'image':
+        info_dict["features"][f"observation.{obs_type}"]["names"] = ["channel", "height", "width"]
 
     with open(meta_dir / "info.json", 'w') as f:
         json.dump(info_dict, f, indent=4)
-    print("Metadata saved to meta/info.json")
 
-    print("Generating tasks.jsonl metadata...")
-    task_entry = {"task_index": 0, "task": task_description}
+    # Tasks.jsonl
     with open(meta_dir / "tasks.jsonl", 'w') as f:
-        f.write(json.dumps(task_entry) + '\n')
-    print("Task metadata saved to meta/tasks.jsonl")
+        f.write(json.dumps({"task_index": 0, "task": task_desc}) + '\n')
 
-    print("Generating episodes.jsonl metadata...")
+    # Episodes.jsonl
     with open(meta_dir / "episodes.jsonl", 'w') as f:
-        for episode_meta in all_episodes_metadata:
-            f.write(json.dumps(episode_meta) + '\n')
-    print("Episode metadata saved to meta/episodes.jsonl")
+        for item in all_episodes_metadata:
+            f.write(json.dumps(item) + '\n')
 
-    # 7. Calculate and save statistics in stats.json
-    print("Calculating dataset statistics for stats.json...")
+    # Stats.json (Retrieve from our StreamingStats objects)
+    print("Finalizing statistics...")
     stats_dict = {}
-    features_to_normalize = [f"observation.{observation_type}", "observation.state", "action", "timestamp"]
-    
-    for feature in features_to_normalize:
-        all_data = np.array(df[feature].tolist(), dtype=np.float32)
-
-        is_image = feature == f"observation.{observation_type}" and observation_type == 'image'
-        
-        if is_image:
-            # For images (N, C, H, W), calculate stats per channel.
-            num_channels = all_data.shape[1]
-            all_data = all_data.transpose(0, 2, 3, 1).reshape(-1, num_channels)
-            print(f"  - Calculating per-channel stats for '{feature}' (shape: {all_data.shape})")
-        else:
-            if all_data.ndim == 1:
-                all_data = all_data.reshape(-1, 1)
-
-        mean_vals = all_data.mean(axis=0)
-        std_vals = all_data.std(axis=0)
-        min_vals = all_data.min(axis=0)
-        max_vals = all_data.max(axis=0)
-
-        # ---- THE FIX: Reshape image stats to (C, 1, 1) ----
-        if is_image:
-            print(f"  - Reshaping stats for '{feature}' to be broadcastable.")
-            mean_vals = mean_vals.reshape(-1, 1, 1)
-            std_vals = std_vals.reshape(-1, 1, 1)
-            min_vals = min_vals.reshape(-1, 1, 1)
-            max_vals = max_vals.reshape(-1, 1, 1)
-            
-        stats_dict[feature] = {
-            "mean": mean_vals.tolist(),
-            "std": std_vals.tolist(),
-            "min": min_vals.tolist(),
-            "max": max_vals.tolist(),
-        }
-        print(f"  - Calculated stats for '{feature}'")
+    for key, tracker in stats_trackers.items():
+        stats_dict[key] = tracker.get_final_stats()
 
     with open(meta_dir / "stats.json", 'w') as f:
         json.dump(stats_dict, f, indent=4)
-    print("Statistics saved to meta/stats.json")
 
     print("\n--- LeRobot Dataset creation complete! ---")
     print(f"Your dataset is ready at: {output_path}")
 
-
 if __name__ == "__main__":
-    my_data_file = "./demos/rgbtest.h5"
-    local_save_path = "./lerobot_datasets/my_final_rgb_dataset"
-    print(f"About to generate dataset at: {local_save_path}")
-    print("Please ensure you have deleted this directory first to avoid errors.")
+    # Ensure you have pyarrow installed: pip install pyarrow pandas h5py numpy
+    my_data_file = "./demos/table_demo.h5"
+    local_save_path = "./lerobot_datasets/table_demo"
+    
+    # Safety check
+    if os.path.exists(local_save_path):
+        import shutil
+        print(f"Warning: Cleaning up existing directory {local_save_path}")
+        shutil.rmtree(local_save_path)
+
     convert_h5_to_final_lerobot_format(my_data_file, local_save_path)
